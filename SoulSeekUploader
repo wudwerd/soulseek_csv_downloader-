@@ -1,0 +1,204 @@
+/bin/bash <<'BASH'
+set -euo pipefail
+
+APPNAME="Soulseek CSV Downloader"
+APPDIR="$HOME/Applications/$APPNAME.app"
+BUILD="$HOME/.local/soulseekcsv_appbuild"
+RES="$BUILD/res"
+
+echo "== Building $APPNAME =="
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 1; }
+python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+python3 -m pip -q install --user flask >/dev/null 2>&1 || true
+
+rm -rf "$BUILD" "$APPDIR"
+mkdir -p "$RES" "$APPDIR/Contents/MacOS" "$APPDIR/Contents/Resources"
+
+cat >"$RES/helper.py" <<'PY'
+#!/usr/bin/env python3
+import os, re, csv, json, uuid, threading, queue, subprocess, tempfile, zipfile, urllib.request, shutil, platform
+from flask import Flask, request, Response, jsonify
+app = Flask(__name__)
+HOME=os.path.expanduser("~"); BASE=os.path.join(HOME,".local","sldl_helper"); BIN=os.path.join(BASE,"bin")
+CFG_DIR=os.path.join(HOME,".config","sldl"); SLDL=os.path.join(BIN,"sldl"); CFG=os.path.join(CFG_DIR,"sldl.conf"); JOBS={}
+os.makedirs(BIN,exist_ok=True); os.makedirs(CFG_DIR,exist_ok=True)
+def _fix(p):
+    try: subprocess.run(["xattr","-dr","com.apple.quarantine",p],check=False)
+    except Exception: pass
+    try: subprocess.run(["chmod","+x",p],check=False)
+    except Exception: pass
+    try: subprocess.run(["codesign","--force","--sign","-",p],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    except Exception: pass
+def ensure_sldl():
+    if os.path.exists(SLDL): _fix(SLDL); return
+    asset="sldl_osx-arm64.zip" if platform.machine()=="arm64" else "sldl_osx-x64.zip"
+    rel=json.loads(urllib.request.urlopen("https://api.github.com/repos/fiso64/slsk-batchdl/releases/latest").read().decode())
+    url=[a["browser_download_url"] for a in rel["assets"] if a["name"]==asset][0]
+    zf=os.path.join(BASE,asset); urllib.request.urlretrieve(url,zf)
+    with zipfile.ZipFile(zf) as z:
+        m=next((n for n in z.namelist() if n.endswith("/sldl") or n=="sldl"),None)
+        if not m: raise RuntimeError("sldl missing in release")
+        z.extract(m,BASE); src=os.path.join(BASE,m); 
+        if os.path.isdir(src): src=os.path.join(src,"sldl")
+    os.makedirs(BIN,exist_ok=True); shutil.move(src,SLDL); os.chmod(SLDL,0o755); _fix(SLDL)
+    try: os.remove(zf)
+    except Exception: pass
+def write_conf(u,p,path):
+    if not path: path=os.path.join(HOME,"Music","Soulseek Downloads")
+    os.makedirs(path,exist_ok=True)
+    esc=path.replace("\\","\\\\").replace('"','\\"')
+    with open(CFG,"w",encoding="utf-8") as f:
+        f.write(f"username = {u}\npassword = {p}\npath = \"{esc}\"\npref-format = mp3\nfast-search = true\n")
+def _n(s): return re.sub(r"[^a-z0-9]+"," ",s.lower()).strip()
+def pick(headers, exacts, partials):
+    nh={h:_n(h) for h in headers}; ex=next((h for h,v in nh.items() if v in exacts),None)
+    if ex: return ex
+    best=None
+    for h,v in nh.items():
+        sc=max((100 if c==v else 50 for c in partials if c in v), default=0); sc+=5 if "name" in v else 0
+        if sc and (not best or sc>best[1]): best=(h,sc)
+    return best[0] if best else None
+def auto_cols(headers):
+    a=pick(headers,{"artist name(s)","artist","artists","performer"},{"artist name","artist","artists","performer"})
+    t=pick(headers,{"track name","title","song name","song"},{"track name","title","song name","song"})
+    al=pick(headers,{"album name","album","release"},{"album name","album","release"})
+    ln=pick(headers,{"duration (ms)","duration","length"},{"duration (ms)","duration","length"})
+    return a,t,al,ln
+def sniff(path):
+    with open(path,"r",encoding="utf-8-sig",errors="ignore",newline="") as fh:
+        sample=fh.read(4096); fh.seek(0)
+        try: d=csv.Sniffer().sniff(sample) if sample else csv.excel
+        except Exception: d=csv.excel
+        r=csv.reader(fh,d); headers=next(r,[]); rows=sum(1 for _ in r)
+    return headers,rows
+@app.after_request
+def cors(resp):
+    resp.headers["Access-Control-Allow-Origin"]="*"; resp.headers["Access-Control-Allow-Headers"]="Content-Type"; resp.headers["Cache-Control"]="no-store"; return resp
+@app.get("/ping")
+def ping(): return "ok",200
+@app.post("/run")
+def run():
+    u=request.form.get("username","").strip(); p=request.form.get("password","").strip(); path=request.form.get("path","").strip()
+    file=request.files.get("csv"); 
+    if not (file and u and p): return jsonify({"error":"Missing CSV or credentials"}),400
+    ensure_sldl(); write_conf(u,p,path)
+    td=tempfile.mkdtemp(prefix="sldl_"); csv_path=os.path.join(td,"input.csv"); file.save(csv_path)
+    headers,total=sniff(csv_path); a,t,al,ln=auto_cols(headers)
+    args=[SLDL,csv_path]; 
+    if a: args+=["--artist-col",a]
+    if t: args+=["--title-col",t]
+    if al: args+=["--album-col",al]
+    if ln: args+=["--length-col",ln]
+    q=queue.Queue(); job=str(uuid.uuid4()); JOBS[job]={"q":q,"done":False,"proc":None}
+    q.put(f"Detected headers: {headers}"); q.put(f"Row count: {total}")
+    q.put(f"Using columns: artist={a} title={t} album={al} length={ln}")
+    q.put("Command: "+" ".join(repr(x) for x in args))
+    try:
+        proc=subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True); JOBS[job]["proc"]=proc
+    except Exception as ex:
+        q.put("Failed to start sldl: "+str(ex)); JOBS[job]["done"]=True; return jsonify({"job":job})
+    def reader():
+        try:
+            for line in iter(proc.stdout.readline,""):
+                if line: q.put(line.rstrip())
+        finally: JOBS[job]["done"]=True
+    threading.Thread(target=reader,daemon=True).start()
+    return jsonify({"job":job})
+@app.get("/logs/<job>")
+def logs(job):
+    if job not in JOBS: return "not found",404
+    q=JOBS[job]["q"]
+    def gen():
+        yield "data: started\n\n"
+        while True:
+            try: yield "data: "+q.get(timeout=0.5).replace("\r"," ")+"\n\n"
+            except queue.Empty:
+                if JOBS[job]["done"] and q.empty(): yield "event: done\ndata: bye\n\n"; break
+                else: yield ": keep-alive\n\n"
+    return Response(gen(), mimetype="text/event-stream")
+@app.post("/stop/<job>")
+def stop(job):
+    if job in JOBS and JOBS[job]["proc"]:
+        try: JOBS[job]["proc"].terminate()
+        except Exception: pass
+    return jsonify({"stopped":job})
+if __name__=="__main__":
+    app.run(host="127.0.0.1",port=8765,debug=False)
+PY
+
+cat >"$RES/index.html" <<'HTML'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Soulseek CSV Downloader</title>
+<style>html,body{margin:0;background:#0f1115;color:#e8e8ea;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.wrap{max-width:980px;margin:36px auto;padding:0 16px}h1{margin:0 0 6px;font-size:28px}p{color:#9aa0a6;margin:0 0 18px}.card{background:#151821;border:1px solid #252a36;border-radius:12px;padding:16px;margin:14px 0}.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1 1 320px}label{display:block;color:#c7ccd1;font-size:13px;margin:8px 0 6px}input[type=text],input[type=password],input[type=file]{width:100%;padding:10px 12px;background:#0f131b;border:1px solid #2a3040;border-radius:8px;color:#e8e8ea}.btn{appearance:none;border:1px solid #2a3040;background:#1a2232;color:#fff;border-radius:8px;padding:10px 14px;cursor:pointer}.btn.primary{background:#2d6cdf;border-color:#2d6cdf}.btn[disabled]{opacity:.5;cursor:not-allowed}.pill{display:inline-block;padding:4px 12px;border:1px solid #2a3040;border-radius:999px;font-size:12px;color:#c7ccd1;margin-left:8px}pre{background:#0b0e14;border:1px solid #252a36;border-radius:8px;padding:12px;white-space:pre-wrap;height:260px;overflow:auto;margin:10px 0 0}</style>
+<div class="wrap"><h1>Soulseek CSV Downloader</h1><p>Upload a CSV, enter your Soulseek login, choose a folder (or leave default), then Start.</p><div class="card">
+<div class="row"><div><label>CSV file</label><input id="csv" type="file" accept=".csv"><div style="font-size:12px;color:#9aa0a6">Drag your CSV here if you like.</div></div>
+<div><label>Save downloads to (optional)</label><input id="path" type="text" placeholder="/Users/you/Music/Soulseek Downloads"><div style="font-size:12px;color:#9aa0a6">Leave empty to use the default Soulseek Downloads folder.</div></div></div>
+<div class="row"><div><label>Soulseek username</label><input id="user" type="text" placeholder="username"></div><div><label>Soulseek password</label><input id="pass" type="password" placeholder="password"></div></div>
+<div class="row" style="align-items:center"><div><button id="start" class="btn primary">Start</button> <button id="stop" class="btn" disabled>Stop</button> <span id="status" class="pill">helper: checking…</span></div></div>
+<pre id="log" aria-live="polite"></pre></div><p style="font-size:12px;color:#9aa0a6">Password only hits your local helper at http://127.0.0.1:8765 — nothing leaves your machine.</p></div>
+<script>
+const $=s=>document.querySelector(s); const logEl=$("#log"); let job=null,sse=null;
+function log(t){logEl.textContent+=t+"\\n"; logEl.scrollTop=logEl.scrollHeight;}
+async function ping(){try{const r=await fetch("http://127.0.0.1:8765/ping"); if(r.ok){$("#status").textContent="helper: ready";return}}catch(e){} $("#status").textContent="helper: not running";}
+$("#start").onclick=async()=>{
+  const f=$("#csv").files[0], u=$("#user").value.trim(), p=$("#pass").value.trim(), path=$("#path").value.trim();
+  if(!f){log("Pick a CSV.");return} if(!u||!p){log("Enter username + password.");return}
+  const fd=new FormData(); fd.append("csv",f); fd.append("username",u); fd.append("password",p); fd.append("path",path);
+  $("#start").disabled=true; $("#stop").disabled=false; logEl.textContent="";
+  try{
+    const r=await fetch("http://127.0.0.1:8765/run",{method:"POST",body:fd}); let j={}; try{j=await r.json()}catch(e){}
+    if(!r.ok){log("Error: "+(j.error||r.statusText)); $("#start").disabled=false; $("#stop").disabled=true; return}
+    job=j.job; sse=new EventSource("http://127.0.0.1:8765/logs/"+job);
+    sse.onmessage=e=>log(e.data); sse.addEventListener("done",()=>{log("Finished."); $("#start").disabled=false; $("#stop").disabled=true; sse.close();});
+    sse.onerror=()=>{log("Helper connection lost."); $("#start").disabled=false; $("#stop").disabled=true; sse.close();};
+    log("Started.");
+  }catch(e){log("Cannot reach helper. Close and reopen the app."); $("#start").disabled=false; $("#stop").disabled=true;}
+};
+$("#stop").onclick=async()=>{ if(!job) return; try{ await fetch("http://127.0.0.1:8765/stop/"+job,{method:"POST"});}catch(e){} if(sse) sse.close(); log("Stop requested."); $("#start").disabled=false; $("#stop").disabled=true; };
+ping(); setInterval(ping,5000);
+</script>
+HTML
+
+cat >"$APPDIR/Contents/MacOS/run" <<'RUN'
+#!/bin/bash
+set -euo pipefail
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+LOG="$HOME/Library/Logs/SoulseekCSV.log"
+python3 -m pip -q install --user flask >/dev/null 2>&1 || true
+cd "$RES"; python3 helper.py >"$LOG" 2>&1 & PID=$!
+trap "kill $PID 2>/dev/null || true" EXIT
+for i in {1..100}; do /usr/bin/curl -s http://127.0.0.1:8765/ping >/dev/null && break; sleep 0.1; done
+open "$RES/index.html"
+wait "$PID"
+RUN
+chmod +x "$APPDIR/Contents/MacOS/run"
+
+cat >"$APPDIR/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>run</string>
+  <key>CFBundleIdentifier</key><string>uk.kwpr.soulseekcsvdl</string>
+  <key>CFBundleName</key><string>Soulseek CSV Downloader</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+</dict></plist>
+PLIST
+
+cat >"$APPDIR/Contents/Resources/troubleshoot_sldl.sh" <<'T'
+#!/bin/bash
+set -euo pipefail
+SLDL="$HOME/.local/sldl_helper/bin/sldl"; LOG="$HOME/Library/Logs/SoulseekCSV.log"
+[[ -f "$SLDL" ]] || { echo "sldl not found: $SLDL"; exit 1; }
+xattr -dr com.apple.quarantine "$SLDL" 2>/dev/null || true
+chmod +x "$SLDL" 2>/dev/null || true
+codesign --force --sign - "$SLDL" 2>/dev/null || true
+"$SLDL" --help || true
+tail -n 60 "$LOG" 2>/dev/null || true
+T
+chmod +x "$APPDIR/Contents/Resources/troubleshoot_sldl.sh"
+
+cp "$RES/index.html" "$RES/helper.py" "$APPDIR/Contents/Resources/"
+rm -rf "$BUILD"
+echo "== Built: $APPDIR =="; open -R "$APPDIR"
+echo "Tip: On first open, Control-click the app → Open → Open (one time)."
+BASH
